@@ -1,0 +1,29 @@
+# Unreal Engine generated/build output
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+.vsconfig
+*.sln
+*.VC.db
+*.VC.VC.opendb
+
+# Per-developer editor UI state (recent files, layout), not project config
+Config/DefaultEditorPerProjectUserSettings.ini
+
+# Content is binary assets (Blueprints, meshes, etc.), not source code
+Content/
+
+# Third-party/IDE-integration plugin, not game code
+Plugins/
+
+# Epic's stock Third Person template variant samples - self-contained,
+# unmodified, not part of the ship game's own code
+Source/ShipGame/Variant_Combat/
+Source/ShipGame/Variant_Platforming/
+Source/ShipGame/Variant_SideScrolling/
+
+# Stray non-code asset at project root
+Clouds_and_Skies.png
