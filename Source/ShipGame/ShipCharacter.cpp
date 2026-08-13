@@ -7,6 +7,11 @@
 #include "SteeringWheel.h"
 #include "ClosetDoor.h"
 #include "Puddle.h"
+#include "ShipBreakComponent.h"
+#include "ShipActor.h"
+#include "ShipToolMenuWidget.h"
+#include "Blueprint/UserWidget.h"
+#include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
@@ -26,12 +31,19 @@ AShipCharacter::AShipCharacter()
 	FirstPersonCamera->SetRelativeLocation(FVector(0.f, 0.f, BaseEyeHeight));
 	FirstPersonCamera->bUsePawnControlRotation = true;
 
-	// Hidden by default - ToggleMop/OnRep_HasMop show it while bHasMop is
-	// true. No collision since it's purely a carried prop.
+	// Hidden by default - OnRep_EquippedTool shows it while EquippedTool is
+	// Mop. No collision since it's purely a carried prop.
 	MopMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("MopMesh"));
 	MopMesh->SetupAttachment(GetMesh(), MopAttachSocketName);
 	MopMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	MopMesh->SetVisibility(false, true);
+
+	// Hidden by default - OnRep_EquippedTool shows it while EquippedTool is
+	// Wrench. No collision, same as MopMesh.
+	WrenchMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WrenchMesh"));
+	WrenchMesh->SetupAttachment(GetMesh(), WrenchAttachSocketName);
+	WrenchMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	WrenchMesh->SetVisibility(false, true);
 
 	GetCharacterMovement()->bOrientRotationToMovement = true;
 	GetCharacterMovement()->RotationRate = FRotator(0.f, 540.f, 0.f);
@@ -82,13 +94,13 @@ void AShipCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCompo
 		{
 			EnhancedInputComponent->BindAction(InteractAction, ETriggerEvent::Started, this, &AShipCharacter::Interact);
 		}
-		if (MainActionAction)
+		if (SwingActionAction)
 		{
-			EnhancedInputComponent->BindAction(MainActionAction, ETriggerEvent::Started, this, &AShipCharacter::MainAction);
+			EnhancedInputComponent->BindAction(SwingActionAction, ETriggerEvent::Started, this, &AShipCharacter::SwingAction);
 		}
-		if (SecondaryActionAction)
+		if (ToolUseActionAction)
 		{
-			EnhancedInputComponent->BindAction(SecondaryActionAction, ETriggerEvent::Started, this, &AShipCharacter::SecondaryAction);
+			EnhancedInputComponent->BindAction(ToolUseActionAction, ETriggerEvent::Started, this, &AShipCharacter::ToolUseAction);
 		}
 	}
 	else
@@ -115,7 +127,7 @@ void AShipCharacter::Look(const FInputActionValue& Value)
 
 void AShipCharacter::DoMove(float Right, float Forward)
 {
-	if (bIsPerformingSecondaryAction || bIsSlipping)
+	if (bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return;
 	}
@@ -149,7 +161,7 @@ void AShipCharacter::DoLook(float Yaw, float Pitch)
 
 void AShipCharacter::DoJumpStart()
 {
-	if (bIsPerformingSecondaryAction || bIsSlipping)
+	if (bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return;
 	}
@@ -165,6 +177,16 @@ void AShipCharacter::DoJumpEnd()
 void AShipCharacter::Interact()
 {
 	ServerInteract();
+}
+
+FVector AShipCharacter::GetInteractionFacingDirection() const
+{
+	if (Controller)
+	{
+		return Controller->GetControlRotation().Vector().GetSafeNormal2D();
+	}
+
+	return GetActorForwardVector().GetSafeNormal2D();
 }
 
 ASteeringWheel* AShipCharacter::FindNearestSteeringWheel() const
@@ -192,7 +214,7 @@ ASteeringWheel* AShipCharacter::FindNearestSteeringWheel() const
 		// Require the character to be roughly facing the wheel, not just nearby,
 		// so walking past one at close range doesn't accidentally engage it.
 		const FVector ToWheel = (Wheel->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
-		const float FacingDot = FVector::DotProduct(GetActorForwardVector().GetSafeNormal2D(), ToWheel);
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToWheel);
 		if (FacingDot < InteractionFacingDotThreshold)
 		{
 			continue;
@@ -230,7 +252,7 @@ AClosetDoor* AShipCharacter::FindNearestClosetDoor() const
 		// Same facing requirement as FindNearestSteeringWheel - walking past
 		// a closet at close range shouldn't accidentally toggle the mop.
 		const FVector ToDoor = (Door->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
-		const float FacingDot = FVector::DotProduct(GetActorForwardVector().GetSafeNormal2D(), ToDoor);
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToDoor);
 		if (FacingDot < InteractionFacingDotThreshold)
 		{
 			continue;
@@ -261,7 +283,7 @@ APuddle* AShipCharacter::FindNearestPuddle() const
 
 		const float Dist = FVector::Dist(GetActorLocation(), Puddle->GetActorLocation());
 		const FVector ToPuddle = (Puddle->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
-		const float FacingDot = FVector::DotProduct(GetActorForwardVector().GetSafeNormal2D(), ToPuddle);
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToPuddle);
 		UE_LOG(LogShipCharacter, Log, TEXT("FindNearestPuddle: candidate '%s' at %.0f cm (CleaningRange=%.0f), facing dot %.2f (min %.2f)"),
 			*GetNameSafe(Puddle), Dist, CleaningRange, FacingDot, InteractionFacingDotThreshold);
 
@@ -288,10 +310,56 @@ APuddle* AShipCharacter::FindNearestPuddle() const
 	return NearestPuddle;
 }
 
-void AShipCharacter::ToggleMop()
+UShipBreakComponent* AShipCharacter::FindNearestActiveShipBreak() const
 {
-	EquippedTool = (EquippedTool == EEquippedTool::Mop) ? EEquippedTool::None : EEquippedTool::Mop;
-	OnRep_EquippedTool();
+	// Assumes exactly one ship is placed in the level, matching
+	// ASteeringWheel/AClosetDoor/APuddle's own ControlledShip lookup for the
+	// same reason.
+	TArray<AActor*> Ships;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), AShipActor::StaticClass(), Ships);
+	AShipActor* Ship = Ships.Num() > 0 ? Cast<AShipActor>(Ships[0]) : nullptr;
+	if (!Ship)
+	{
+		return nullptr;
+	}
+
+	UShipBreakComponent* NearestBreak = nullptr;
+	float NearestDistSq = FMath::Square(WrenchRange);
+
+	for (UShipBreakComponent* Break : Ship->ShipBreakComponents)
+	{
+		if (!Break || !Break->IsBroken())
+		{
+			continue;
+		}
+
+		const float Dist = FVector::Dist(GetActorLocation(), Break->GetComponentLocation());
+		const FVector ToBreak = (Break->GetComponentLocation() - GetActorLocation()).GetSafeNormal2D();
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToBreak);
+		UE_LOG(LogShipCharacter, Log, TEXT("FindNearestActiveShipBreak: candidate '%s' at %.0f cm (WrenchRange=%.0f), facing dot %.2f (min %.2f)"),
+			*GetNameSafe(Break), Dist, WrenchRange, FacingDot, InteractionFacingDotThreshold);
+
+		const float DistSq = Dist * Dist;
+		if (DistSq > NearestDistSq)
+		{
+			continue;
+		}
+
+		// Same facing requirement as FindNearestPuddle - a break merely
+		// nearby, but off to the side or behind, shouldn't count.
+		if (FacingDot < InteractionFacingDotThreshold)
+		{
+			continue;
+		}
+
+		NearestDistSq = DistSq;
+		NearestBreak = Break;
+	}
+
+	UE_LOG(LogShipCharacter, Log, TEXT("FindNearestActiveShipBreak: %d active UShipBreakComponent(s) on ship, chose '%s'"),
+		Ship->ShipBreakComponents.Num(), NearestBreak ? *GetNameSafe(NearestBreak) : TEXT("none"));
+
+	return NearestBreak;
 }
 
 void AShipCharacter::OnRep_EquippedTool()
@@ -299,6 +367,10 @@ void AShipCharacter::OnRep_EquippedTool()
 	if (MopMesh)
 	{
 		MopMesh->SetVisibility(EquippedTool == EEquippedTool::Mop, true);
+	}
+	if (WrenchMesh)
+	{
+		WrenchMesh->SetVisibility(EquippedTool == EEquippedTool::Wrench, true);
 	}
 }
 
@@ -312,8 +384,79 @@ void AShipCharacter::ServerInteract_Implementation()
 
 	if (FindNearestClosetDoor())
 	{
-		ToggleMop();
+		ClientOpenToolMenu();
 	}
+}
+
+void AShipCharacter::ClientOpenToolMenu_Implementation()
+{
+	if (!ToolMenuWidgetClass || ToolMenuWidget)
+	{
+		return;
+	}
+
+	APlayerController* PC = GetController<APlayerController>();
+	if (!PC)
+	{
+		return;
+	}
+
+	ToolMenuWidget = CreateWidget<UShipToolMenuWidget>(PC, ToolMenuWidgetClass);
+	if (ToolMenuWidget)
+	{
+		ToolMenuWidget->OwningCharacter = this;
+		ToolMenuWidget->SetIsFocusable(true);
+		ToolMenuWidget->AddToPlayerScreen(0);
+
+		// Modal selection UI - route all input to it (and away from the
+		// character's Enhanced Input bindings, which is why the widget itself
+		// - not a Server RPC - has to detect Escape/Interact to close it
+		// again, see UShipToolMenuWidget::NativeOnKeyDown) while it's open.
+		FInputModeUIOnly InputMode;
+		InputMode.SetWidgetToFocus(ToolMenuWidget->TakeWidget());
+		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+		PC->SetInputMode(InputMode);
+		PC->SetShowMouseCursor(true);
+	}
+}
+
+void AShipCharacter::RestoreGameInputModeAndCloseToolMenu()
+{
+	if (!ToolMenuWidget)
+	{
+		return;
+	}
+
+	ToolMenuWidget->RemoveFromParent();
+	ToolMenuWidget = nullptr;
+
+	if (APlayerController* PC = GetController<APlayerController>())
+	{
+		PC->SetInputMode(FInputModeGameOnly());
+		PC->SetShowMouseCursor(false);
+	}
+}
+
+void AShipCharacter::CloseToolMenu()
+{
+	RestoreGameInputModeAndCloseToolMenu();
+}
+
+void AShipCharacter::RequestEquipTool(EEquippedTool NewTool)
+{
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
+	{
+		return;
+	}
+
+	ServerSetEquippedTool(NewTool);
+	RestoreGameInputModeAndCloseToolMenu();
+}
+
+void AShipCharacter::ServerSetEquippedTool_Implementation(EEquippedTool NewTool)
+{
+	EquippedTool = NewTool;
+	OnRep_EquippedTool();
 }
 
 const FToolDefinition* AShipCharacter::GetEquippedToolDefinition() const
@@ -323,7 +466,7 @@ const FToolDefinition* AShipCharacter::GetEquippedToolDefinition() const
 
 bool AShipCharacter::CanSwingEquippedTool() const
 {
-	if (bIsSwinging || bIsPerformingSecondaryAction || bIsSlipping)
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return false;
 	}
@@ -332,25 +475,25 @@ bool AShipCharacter::CanSwingEquippedTool() const
 	return ToolDef && ToolDef->bCanSwing;
 }
 
-bool AShipCharacter::CanUseSecondaryActionOnEquippedTool() const
+bool AShipCharacter::CanUseToolUseActionOnEquippedTool() const
 {
-	if (bIsSwinging || bIsPerformingSecondaryAction || bIsSlipping)
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return false;
 	}
 
 	const FToolDefinition* ToolDef = GetEquippedToolDefinition();
-	return ToolDef && ToolDef->bCanUseSecondaryAction;
+	return ToolDef && ToolDef->bCanUseToolUseAction;
 }
 
-void AShipCharacter::MainAction()
+void AShipCharacter::SwingAction()
 {
 	if (!CanSwingEquippedTool())
 	{
 		return;
 	}
 
-	ServerMainAction();
+	ServerSwingAction();
 }
 
 void AShipCharacter::FinishSwing()
@@ -358,9 +501,9 @@ void AShipCharacter::FinishSwing()
 	bIsSwinging = false;
 }
 
-void AShipCharacter::ServerMainAction_Implementation()
+void AShipCharacter::ServerSwingAction_Implementation()
 {
-	if (bIsSwinging || bIsPerformingSecondaryAction || bIsSlipping)
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return;
 	}
@@ -385,29 +528,46 @@ void AShipCharacter::MulticastPlaySwing_Implementation(UAnimMontage* MontageToPl
 	}
 }
 
-void AShipCharacter::SecondaryAction()
+void AShipCharacter::ToolUseAction()
 {
-	if (!CanUseSecondaryActionOnEquippedTool())
+	if (bIsPerformingToolUseAction)
+	{
+		// Already mid tool-use-action - if the equipped tool allows canceling
+		// it (see FToolDefinition::bToolUseActionInterruptible), a second
+		// press interrupts instead of being ignored. ServerCancelToolUseAction
+		// re-validates this server-side.
+		const FToolDefinition* ToolDef = GetEquippedToolDefinition();
+		if (ToolDef && ToolDef->bToolUseActionInterruptible)
+		{
+			ServerCancelToolUseAction();
+		}
+		return;
+	}
+
+	if (!CanUseToolUseActionOnEquippedTool())
 	{
 		return;
 	}
 
-	ServerSecondaryAction();
+	ServerToolUseAction();
 }
 
-void AShipCharacter::FinishSecondaryAction()
+void AShipCharacter::FinishToolUseAction()
 {
-	bIsPerformingSecondaryAction = false;
+	bIsPerformingToolUseAction = false;
 }
 
-void AShipCharacter::ResolveSecondaryActionEffect()
+void AShipCharacter::ResolveToolUseActionEffect()
 {
-	UE_LOG(LogShipCharacter, Log, TEXT("ResolveSecondaryActionEffect: EquippedTool=%d"), static_cast<int32>(EquippedTool));
+	UE_LOG(LogShipCharacter, Log, TEXT("ResolveToolUseActionEffect: EquippedTool=%d"), static_cast<int32>(EquippedTool));
 
 	switch (EquippedTool)
 	{
 	case EEquippedTool::Mop:
 		PerformMopClean();
+		break;
+	case EEquippedTool::Wrench:
+		PerformWrenchFix();
 		break;
 	default:
 		break;
@@ -425,36 +585,56 @@ void AShipCharacter::PerformMopClean()
 	}
 }
 
-void AShipCharacter::ServerSecondaryAction_Implementation()
+void AShipCharacter::PerformWrenchFix()
 {
-	if (bIsSwinging || bIsPerformingSecondaryAction || bIsSlipping)
+	UShipBreakComponent* BreakComponent = FindNearestActiveShipBreak();
+	UE_LOG(LogShipCharacter, Log, TEXT("PerformWrenchFix: %s"), BreakComponent ? *GetNameSafe(BreakComponent) : TEXT("no active ShipBreak in range/facing - nothing to fix"));
+
+	if (!BreakComponent)
 	{
-		UE_LOG(LogShipCharacter, Warning, TEXT("ServerSecondaryAction: rejected - bIsSwinging=%d bIsPerformingSecondaryAction=%d bIsSlipping=%d"), bIsSwinging, bIsPerformingSecondaryAction, bIsSlipping);
+		return;
+	}
+
+	if (AShipActor* Ship = Cast<AShipActor>(BreakComponent->GetOwner()))
+	{
+		Ship->RepairHull(BreakComponent->HullRepairAmount);
+	}
+
+	// Turn it back off rather than destroying it - see UShipBreakComponent's
+	// class comment - so the same break can activate again later.
+	BreakComponent->SetBroken(false);
+}
+
+void AShipCharacter::ServerToolUseAction_Implementation()
+{
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
+	{
+		UE_LOG(LogShipCharacter, Warning, TEXT("ServerToolUseAction: rejected - bIsSwinging=%d bIsPerformingToolUseAction=%d bIsSlipping=%d"), bIsSwinging, bIsPerformingToolUseAction, bIsSlipping);
 		return;
 	}
 
 	const FToolDefinition* ToolDef = GetEquippedToolDefinition();
-	if (!ToolDef || !ToolDef->bCanUseSecondaryAction)
+	if (!ToolDef || !ToolDef->bCanUseToolUseAction)
 	{
-		UE_LOG(LogShipCharacter, Warning, TEXT("ServerSecondaryAction: rejected - no FToolDefinition for EquippedTool=%d, or bCanUseSecondaryAction=false"), static_cast<int32>(EquippedTool));
+		UE_LOG(LogShipCharacter, Warning, TEXT("ServerToolUseAction: rejected - no FToolDefinition for EquippedTool=%d, or bCanUseToolUseAction=false"), static_cast<int32>(EquippedTool));
 		return;
 	}
 
-	MulticastPlaySecondaryAction(ToolDef->SecondaryActionMontage, ToolDef->SecondaryActionDuration);
+	MulticastPlayToolUseAction(ToolDef->ToolUseActionMontage, ToolDef->ToolUseActionDuration);
 
 	// Server-authoritative resolution of the actual gameplay effect (e.g.
 	// destroying a puddle), timed to land once the lock/montage duration
 	// elapses - kept on its own timer, separate from the per-machine cosmetic
 	// unlock each client (and the server itself) runs via
-	// MulticastPlaySecondaryAction/FinishSecondaryAction, so the effect only
+	// MulticastPlayToolUseAction/FinishToolUseAction, so the effect only
 	// ever runs once.
-	GetWorldTimerManager().SetTimer(SecondaryActionEffectTimerHandle, this, &AShipCharacter::ResolveSecondaryActionEffect, ToolDef->SecondaryActionDuration, false);
+	GetWorldTimerManager().SetTimer(ToolUseActionEffectTimerHandle, this, &AShipCharacter::ResolveToolUseActionEffect, ToolDef->ToolUseActionDuration, false);
 }
 
-void AShipCharacter::MulticastPlaySecondaryAction_Implementation(UAnimMontage* MontageToPlay, float Duration)
+void AShipCharacter::MulticastPlayToolUseAction_Implementation(UAnimMontage* MontageToPlay, float Duration)
 {
-	bIsPerformingSecondaryAction = true;
-	GetWorldTimerManager().SetTimer(SecondaryActionTimerHandle, this, &AShipCharacter::FinishSecondaryAction, Duration, false);
+	bIsPerformingToolUseAction = true;
+	GetWorldTimerManager().SetTimer(ToolUseActionTimerHandle, this, &AShipCharacter::FinishToolUseAction, Duration, false);
 
 	if (UAnimInstance* AnimInstance = MontageToPlay && GetMesh() ? GetMesh()->GetAnimInstance() : nullptr)
 	{
@@ -462,9 +642,41 @@ void AShipCharacter::MulticastPlaySecondaryAction_Implementation(UAnimMontage* M
 	}
 }
 
+void AShipCharacter::ServerCancelToolUseAction_Implementation()
+{
+	if (!bIsPerformingToolUseAction)
+	{
+		return;
+	}
+
+	const FToolDefinition* ToolDef = GetEquippedToolDefinition();
+	if (!ToolDef || !ToolDef->bToolUseActionInterruptible)
+	{
+		UE_LOG(LogShipCharacter, Warning, TEXT("ServerCancelToolUseAction: rejected - no FToolDefinition for EquippedTool=%d, or bToolUseActionInterruptible=false"), static_cast<int32>(EquippedTool));
+		return;
+	}
+
+	// Stops the pending ResolveToolUseActionEffect call - canceling always
+	// skips the effect (e.g. the wrench's hull repair).
+	GetWorldTimerManager().ClearTimer(ToolUseActionEffectTimerHandle);
+
+	MulticastCancelToolUseAction();
+}
+
+void AShipCharacter::MulticastCancelToolUseAction_Implementation()
+{
+	bIsPerformingToolUseAction = false;
+	GetWorldTimerManager().ClearTimer(ToolUseActionTimerHandle);
+
+	if (UAnimInstance* AnimInstance = GetMesh() ? GetMesh()->GetAnimInstance() : nullptr)
+	{
+		AnimInstance->Montage_Stop(0.25f);
+	}
+}
+
 void AShipCharacter::TrySlip()
 {
-	if (bIsSwinging || bIsPerformingSecondaryAction || bIsSlipping || bIsImmuneToSlipping)
+	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping || bIsImmuneToSlipping)
 	{
 		return;
 	}

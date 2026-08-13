@@ -6,6 +6,7 @@
 #include "Camera/CameraShakeBase.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "GameFramework/PlayerController.h"
+#include "ShipBreakComponent.h"
 #include "TimerManager.h"
 
 AShipActor::AShipActor()
@@ -36,6 +37,14 @@ AShipActor::AShipActor()
 	ShipMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	ShipMesh->SetCollisionResponseToAllChannels(ECR_Block);
 
+	// Pure data volume - no collision of its own (see GetRandomDeckLocation).
+	// Placeholder extent/position - resize/reposition per ship variant in
+	// its Blueprint to roughly cover the actual deck.
+	DeckArea = CreateDefaultSubobject<UBoxComponent>(TEXT("DeckArea"));
+	DeckArea->SetupAttachment(RootComponent);
+	DeckArea->SetBoxExtent(FVector(280.f, 140.f, 5.f));
+	DeckArea->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
 	// Create 4 spawn point components as children of the ship.
 	// Default positions are all at the origin - reposition them in the
 	// editor/Blueprint after placing the ship in your level.
@@ -65,6 +74,11 @@ AShipActor::AShipActor()
 void AShipActor::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// Picks up every UShipBreakComponent a Blueprint added in its Components
+	// panel - see the property comment in ShipActor.h for why this is
+	// discovered at runtime rather than authored as a fixed C++ array.
+	GetComponents<UShipBreakComponent>(ShipBreakComponents);
 }
 
 void AShipActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -255,6 +269,32 @@ USceneComponent* AShipActor::GetSpawnPoint(int32 Index) const
 	return RootComponent;
 }
 
+bool AShipActor::GetRandomDeckLocation(FVector& OutLocation) const
+{
+	if (!DeckArea)
+	{
+		return false;
+	}
+
+	// Unscaled extent - TransformPosition below applies DeckArea's own scale
+	// (along with its rotation/translation), so using the already-scaled
+	// extent here would double-apply it.
+	const FVector Extent = DeckArea->GetUnscaledBoxExtent();
+
+	// Random point in DeckArea's local XY footprint, at its own local Z (0) -
+	// i.e. on the deck surface itself. Transforming through DeckArea's own
+	// component-to-world (rather than just offsetting its world location)
+	// keeps the point correctly on the deck plane even while the ship is
+	// tilted (see MoveShip's pitch/roll).
+	const FVector RandomLocal(
+		FMath::FRandRange(-Extent.X, Extent.X),
+		FMath::FRandRange(-Extent.Y, Extent.Y),
+		0.f);
+
+	OutLocation = DeckArea->GetComponentTransform().TransformPosition(RandomLocal);
+	return true;
+}
+
 void AShipActor::OnShipMeshHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
 	// Only the server sweeps for collision (see MoveShip's HasAuthority()
@@ -294,6 +334,9 @@ void AShipActor::ApplyCrashDamage()
 
 	HullIntegrity = FMath::Max(HullIntegrity - HullDamagePerCrash, 0.f);
 
+	DamageSinceLastShipBreakActivation += HullDamagePerCrash;
+	TryActivateShipBreaks();
+
 	MulticastOnCrash();
 
 	if (HullIntegrity <= 0.f)
@@ -301,6 +344,44 @@ void AShipActor::ApplyCrashDamage()
 		bHullDestroyed = true;
 		MulticastOnHullDestroyed();
 	}
+}
+
+void AShipActor::RepairHull(float Amount)
+{
+	if (bHullDestroyed)
+	{
+		return;
+	}
+
+	HullIntegrity = FMath::Clamp(HullIntegrity + Amount, 0.f, 100.f);
+}
+
+void AShipActor::TryActivateShipBreaks()
+{
+	while (DamageSinceLastShipBreakActivation >= DamagePerShipBreakActivation)
+	{
+		DamageSinceLastShipBreakActivation -= DamagePerShipBreakActivation;
+		ActivateRandomShipBreak();
+	}
+}
+
+void AShipActor::ActivateRandomShipBreak()
+{
+	TArray<UShipBreakComponent*> InactiveBreaks;
+	for (UShipBreakComponent* Break : ShipBreakComponents)
+	{
+		if (Break && !Break->IsBroken())
+		{
+			InactiveBreaks.Add(Break);
+		}
+	}
+
+	if (InactiveBreaks.Num() == 0)
+	{
+		return;
+	}
+
+	InactiveBreaks[FMath::RandHelper(InactiveBreaks.Num())]->SetBroken(true);
 }
 
 void AShipActor::MulticastOnCrash_Implementation()

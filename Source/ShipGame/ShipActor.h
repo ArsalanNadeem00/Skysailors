@@ -9,6 +9,7 @@ class UPrimitiveComponent;
 class UBoxComponent;
 class UCameraShakeBase;
 class APlayerController;
+class UShipBreakComponent;
 
 /**
  * The ship the players spawn on/around. Moves forward at a constant speed.
@@ -89,16 +90,16 @@ public:
 	// clients know the correct speed if you ever change it at runtime (e.g.
 	// via a server-side event) rather than only at BeginPlay.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "Ship|Movement")
-	float ForwardSpeed = 200.f;
+	float ForwardSpeed = 1200.f;
 
 	// Yaw turn rate in degrees/sec at full A/D helm input.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Ship|Movement")
-	float HelmYawRate = 12;
+	float HelmYawRate = 14.f;
 
 	// Ascend/descend speed in cm/s at full W/S helm input. Kept low - vertical
 	// movement is meant to be slow and gradual, not a fast elevator.
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Ship|Movement")
-	float HelmVerticalSpeed = 40.f;
+	float HelmVerticalSpeed = 55.f;
 
 	// Pitch (degrees) the ship holds while ascending/descending (W/S held).
 	// Eases back to level once released - see TiltRecoverySpeed.
@@ -134,6 +135,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ship")
 	USceneComponent* GetSpawnPoint(int32 Index) const;
 
+	// Picks a uniformly random point within DeckArea's horizontal footprint,
+	// at DeckArea's own height - i.e. somewhere on the ship's walkable deck
+	// surface, never below it. Returns false (leaving OutLocation untouched)
+	// if DeckArea is unset.
+	UFUNCTION(BlueprintPure, Category = "Ship")
+	bool GetRandomDeckLocation(FVector& OutLocation) const;
+
 	// Invisible box, and the RootComponent (see the class comment above) -
 	// the thing MoveShip actually sweeps for collision each tick. The ship
 	// is really several separate static meshes (hull, deck, mast, etc.), no
@@ -145,6 +153,17 @@ public:
 	// variant in its Blueprint to roughly wrap that ship's silhouette.
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ship|Hull")
 	UBoxComponent* HazardBox;
+
+	// Horizontal footprint (and height, via its own world Z) of the ship's
+	// walkable deck surface - used by GetRandomDeckLocation to pick a random
+	// above-deck spot (e.g. for ARainZone to spawn a puddle at). A
+	// placeholder like HazardBox - resize/reposition per ship variant in its
+	// Blueprint to roughly cover the actual deck (keep it thin along Z; only
+	// its footprint and center height matter, see GetRandomDeckLocation).
+	// Attached to HazardBox so it rides along with the ship like everything
+	// else - no collision of its own, it's a pure data volume.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Ship|Hull")
+	UBoxComponent* DeckArea;
 
 	// Ship's health. Starts at 100, drops by HullDamagePerCrash each time
 	// HazardBox hits something tagged "crash" (see OnShipMeshHit).
@@ -177,7 +196,7 @@ public:
 	// automatically get a proportionally bigger knockback. See
 	// StartCrashKnockback.
 	UPROPERTY(EditDefaultsOnly, Category = "Ship|Hull")
-	float CrashKnockbackLengthMultiplier = 0.5f;
+	float CrashKnockbackLengthMultiplier = 2.5f;
 
 	// How long (seconds) the knockback takes to play out - eased over time
 	// in MoveShip as a temporary backward velocity added on top of the
@@ -212,6 +231,32 @@ public:
 	// [-1,1] (W = ascend/+1, S = descend/-1). Triggers the momentary tilt kick
 	// whenever vertical movement starts or reverses direction.
 	void SetHelmVerticalInput(float VerticalInput);
+
+	// Restores HullIntegrity by Amount, clamped to [0, 100] - called by
+	// AShipCharacter::PerformWrenchFix when a wrench's tool-use action
+	// resolves next to an active UShipBreakComponent. Server-only, same as
+	// ApplyCrashDamage: assumes its caller is already authoritative rather
+	// than checking HasAuthority() itself. No-ops once bHullDestroyed,
+	// matching ApplyCrashDamage's own guard - a destroyed ship has no hull
+	// left to repair.
+	void RepairHull(float Amount);
+
+	// How much cumulative crash damage (see ApplyCrashDamage) activates one
+	// random currently-inactive UShipBreakComponent - see
+	// ActivateRandomShipBreak/DamageSinceLastShipBreakActivation.
+	UPROPERTY(EditDefaultsOnly, Category = "Ship|Hull")
+	float DamagePerShipBreakActivation = 10.f;
+
+	// Every UShipBreakComponent found on this actor - populated once in
+	// BeginPlay (see GetComponents call there) rather than authored as a
+	// fixed-size array in C++ (like SpawnPoints), since the whole point is
+	// that a Blueprint can add as many as it wants, individually positioned,
+	// via its Components panel. Populated on every machine (both the wrench
+	// range/facing check in AShipCharacter::FindNearestActiveShipBreak and
+	// ActivateRandomShipBreak's random pick need the full list locally), but
+	// only the server ever actually calls SetBroken on one of them.
+	UPROPERTY(BlueprintReadOnly, Category = "Ship|Hull")
+	TArray<TObjectPtr<UShipBreakComponent>> ShipBreakComponents;
 
 protected:
 	// Advances the ship's position/rotation each tick. Runs on every machine
@@ -332,4 +377,24 @@ protected:
 	// True once HullIntegrity has reached 0, so further collisions afterward
 	// don't re-trigger the destroyed sequence. Server-only.
 	bool bHullDestroyed = false;
+
+	// Cumulative crash damage taken since the last time a UShipBreakComponent
+	// was activated - see ApplyCrashDamage/TryActivateShipBreaks. Decremented
+	// (not reset to zero) by DamagePerShipBreakActivation each time a break
+	// activates, so a single hit big enough to cross the threshold twice over
+	// activates two breaks at once rather than losing the remainder. Server-only.
+	float DamageSinceLastShipBreakActivation = 0.f;
+
+	// Called from ApplyCrashDamage after adding the latest hit's damage to
+	// DamageSinceLastShipBreakActivation - activates one random inactive
+	// UShipBreakComponent (see ActivateRandomShipBreak) for every full
+	// DamagePerShipBreakActivation accumulated, in case a single hit crosses
+	// the threshold more than once. Server-only.
+	void TryActivateShipBreaks();
+
+	// Picks a uniformly random currently-inactive entry from
+	// ShipBreakComponents and calls SetBroken(true) on it - no-ops if every
+	// break is already active (or there are none). Server-only, called only
+	// from TryActivateShipBreaks.
+	void ActivateRandomShipBreak();
 };
