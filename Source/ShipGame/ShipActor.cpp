@@ -356,6 +356,25 @@ void AShipActor::RepairHull(float Amount)
 	HullIntegrity = FMath::Clamp(HullIntegrity + Amount, 0.f, 100.f);
 }
 
+void AShipActor::ApplyDamage(float Amount)
+{
+	if (bHullDestroyed)
+	{
+		return;
+	}
+
+	HullIntegrity = FMath::Max(HullIntegrity - Amount, 0.f);
+
+	DamageSinceLastShipBreakActivation += Amount;
+	TryActivateShipBreaks();
+
+	if (HullIntegrity <= 0.f)
+	{
+		bHullDestroyed = true;
+		MulticastOnHullDestroyed();
+	}
+}
+
 void AShipActor::TryActivateShipBreaks()
 {
 	while (DamageSinceLastShipBreakActivation >= DamagePerShipBreakActivation)

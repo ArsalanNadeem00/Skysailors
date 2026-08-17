@@ -241,6 +241,24 @@ public:
 	// left to repair.
 	void RepairHull(float Amount);
 
+	// Drops HullIntegrity by Amount (floored at 0), feeds the same
+	// DamageSinceLastShipBreakActivation/TryActivateShipBreaks accounting
+	// ApplyCrashDamage does (so weapon fire activates UShipBreakComponents
+	// exactly like ramming does), and - if that reaches 0 - triggers the
+	// same "ship destroyed" sequence as ApplyCrashDamage
+	// (MulticastOnHullDestroyed). Called by ACannonProjectile::OnHit when a
+	// hostile projectile (see ACannonProjectile::bDamagesPlayerShip, set by
+	// UEnemyGunComponent) hits this ship's hull. Deliberately doesn't reuse
+	// ApplyCrashDamage wholesale, though: this is a discrete, one-shot hit
+	// (the projectile destroys itself on impact), unlike a collision that
+	// can stay wedged and re-trigger every tick, so there's no cooldown to
+	// enforce here - and weapon fire doesn't need HullDamagePerCrash's flat
+	// amount or the camera shake/knockback (that's specifically ramming
+	// feedback, not requested for weapon hits). Server-only, same
+	// assumes-caller-is-authoritative convention as RepairHull/
+	// ApplyCrashDamage.
+	void ApplyDamage(float Amount);
+
 	// How much cumulative crash damage (see ApplyCrashDamage) activates one
 	// random currently-inactive UShipBreakComponent - see
 	// ActivateRandomShipBreak/DamageSinceLastShipBreakActivation.

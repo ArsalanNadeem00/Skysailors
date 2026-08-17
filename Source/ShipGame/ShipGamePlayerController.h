@@ -9,6 +9,8 @@
 class UInputMappingContext;
 class UUserWidget;
 class UHelmHUDWidget;
+class UCannonWidget;
+class ACannon;
 
 /**
  *  Basic PlayerController class for a third person game
@@ -52,6 +54,18 @@ protected:
 	UPROPERTY()
 	TObjectPtr<UHelmHUDWidget> HelmHUDWidget;
 
+	// Class of the on-screen aiming/ammo widget shown while this player is
+	// operating an ACannon (see HandlePossessedPawnChanged). Left unset
+	// disables it.
+	UPROPERTY(EditAnywhere, Category = "UI|Cannon")
+	TSubclassOf<UCannonWidget> CannonWidgetClass;
+
+	// Only non-null while this player currently possesses an ACannon -
+	// created and destroyed by HandlePossessedPawnChanged, same pattern as
+	// HelmHUDWidget.
+	UPROPERTY()
+	TObjectPtr<UCannonWidget> CannonWidget;
+
 	/** Gameplay initialization */
 	virtual void BeginPlay() override;
 
@@ -64,9 +78,10 @@ protected:
 	// Bound to OnPossessedPawnChanged (fires on the server and, separately,
 	// on the owning client via Pawn's OnRep - never on other clients, since
 	// PlayerController only replicates to its own owning connection) - this
-	// is what keeps the helm HUD visible only to the player actually at the
-	// wheel. Shows/creates the widget when NewPawn is an ASteeringWheel,
-	// hides/destroys it otherwise.
+	// is what keeps the helm HUD/cannon widget visible only to the player
+	// actually at the wheel/cannon. Shows/creates HelmHUDWidget when NewPawn
+	// is an ASteeringWheel and CannonWidget when it's an ACannon,
+	// hiding/destroying whichever one doesn't match otherwise.
 	UFUNCTION()
 	void HandlePossessedPawnChanged(APawn* PreviouslyPossessedPawn, APawn* NewPawn);
 

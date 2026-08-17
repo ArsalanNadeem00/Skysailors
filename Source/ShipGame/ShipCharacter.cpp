@@ -9,6 +9,9 @@
 #include "Puddle.h"
 #include "ShipBreakComponent.h"
 #include "ShipActor.h"
+#include "Mount.h"
+#include "MountableItem.h"
+#include "Cannon.h"
 #include "ShipToolMenuWidget.h"
 #include "Blueprint/UserWidget.h"
 #include "GameFramework/PlayerController.h"
@@ -69,6 +72,7 @@ void AShipCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AShipCharacter, EquippedTool);
+	DOREPLIFETIME(AShipCharacter, CarriedMountItem);
 }
 
 void AShipCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -227,6 +231,44 @@ ASteeringWheel* AShipCharacter::FindNearestSteeringWheel() const
 	return NearestWheel;
 }
 
+ACannon* AShipCharacter::FindNearestOperableCannon() const
+{
+	TArray<AActor*> Cannons;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ACannon::StaticClass(), Cannons);
+
+	ACannon* NearestCannon = nullptr;
+	float NearestDistSq = FMath::Square(CannonInteractionRange);
+
+	for (AActor* Actor : Cannons)
+	{
+		ACannon* Cannon = Cast<ACannon>(Actor);
+		if (!Cannon || Cannon->IsOccupied() || !Cast<AMount>(Cannon->GetAttachParentActor()))
+		{
+			continue;
+		}
+
+		const float DistSq = FVector::DistSquared(GetActorLocation(), Cannon->GetActorLocation());
+		if (DistSq > NearestDistSq)
+		{
+			continue;
+		}
+
+		// Same facing requirement as FindNearestSteeringWheel/FindNearestClosetDoor
+		// - a cannon merely nearby, but off to the side or behind, shouldn't count.
+		const FVector ToCannon = (Cannon->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToCannon);
+		if (FacingDot < InteractionFacingDotThreshold)
+		{
+			continue;
+		}
+
+		NearestDistSq = DistSq;
+		NearestCannon = Cannon;
+	}
+
+	return NearestCannon;
+}
+
 AClosetDoor* AShipCharacter::FindNearestClosetDoor() const
 {
 	TArray<AActor*> Doors;
@@ -362,6 +404,44 @@ UShipBreakComponent* AShipCharacter::FindNearestActiveShipBreak() const
 	return NearestBreak;
 }
 
+AMount* AShipCharacter::FindNearestMount(bool bRequireEmpty) const
+{
+	TArray<AActor*> Mounts;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), AMount::StaticClass(), Mounts);
+
+	AMount* NearestMount = nullptr;
+	float NearestDistSq = FMath::Square(MountInteractionRange);
+
+	for (AActor* Actor : Mounts)
+	{
+		AMount* Mount = Cast<AMount>(Actor);
+		if (!Mount || Mount->IsEmpty() != bRequireEmpty)
+		{
+			continue;
+		}
+
+		const float DistSq = FVector::DistSquared(GetActorLocation(), Mount->GetActorLocation());
+		if (DistSq > NearestDistSq)
+		{
+			continue;
+		}
+
+		// Same facing requirement as the other FindNearest* helpers - a
+		// mount merely nearby, but off to the side or behind, shouldn't count.
+		const FVector ToMount = (Mount->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+		const float FacingDot = FVector::DotProduct(GetInteractionFacingDirection(), ToMount);
+		if (FacingDot < InteractionFacingDotThreshold)
+		{
+			continue;
+		}
+
+		NearestDistSq = DistSq;
+		NearestMount = Mount;
+	}
+
+	return NearestMount;
+}
+
 void AShipCharacter::OnRep_EquippedTool()
 {
 	if (MopMesh)
@@ -379,6 +459,12 @@ void AShipCharacter::ServerInteract_Implementation()
 	if (ASteeringWheel* Wheel = FindNearestSteeringWheel())
 	{
 		Wheel->TryEngage(GetController(), this);
+		return;
+	}
+
+	if (ACannon* Cannon = FindNearestOperableCannon())
+	{
+		Cannon->TryEngage(GetController(), this);
 		return;
 	}
 
@@ -488,7 +574,12 @@ bool AShipCharacter::CanUseToolUseActionOnEquippedTool() const
 
 void AShipCharacter::SwingAction()
 {
-	if (!CanSwingEquippedTool())
+	// While carrying a mount item, left/right-click always try to place it
+	// (see ServerSwingAction_Implementation) regardless of what's equipped -
+	// CarriedMountItem is replicated specifically so this local check works
+	// on the owning client without an equipped tool that otherwise allows
+	// swinging.
+	if (!CarriedMountItem && !CanSwingEquippedTool())
 	{
 		return;
 	}
@@ -503,6 +594,12 @@ void AShipCharacter::FinishSwing()
 
 void AShipCharacter::ServerSwingAction_Implementation()
 {
+	if (CarriedMountItem)
+	{
+		TryPlaceCarriedMountItem();
+		return;
+	}
+
 	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
 	{
 		return;
@@ -544,7 +641,10 @@ void AShipCharacter::ToolUseAction()
 		return;
 	}
 
-	if (!CanUseToolUseActionOnEquippedTool())
+	// While carrying a mount item, left/right-click always try to place it
+	// (see ServerToolUseAction_Implementation) regardless of what's equipped -
+	// same reasoning as SwingAction's CarriedMountItem check.
+	if (!CarriedMountItem && !CanUseToolUseActionOnEquippedTool())
 	{
 		return;
 	}
@@ -592,6 +692,9 @@ void AShipCharacter::PerformWrenchFix()
 
 	if (!BreakComponent)
 	{
+		// Nothing to repair in range - see if the wrench is instead being
+		// pointed at an occupied AMount to strip its item.
+		TryRemoveMountItem();
 		return;
 	}
 
@@ -605,8 +708,60 @@ void AShipCharacter::PerformWrenchFix()
 	BreakComponent->SetBroken(false);
 }
 
+void AShipCharacter::TryRemoveMountItem()
+{
+	if (CarriedMountItem)
+	{
+		return;
+	}
+
+	AMount* Mount = FindNearestMount(/*bRequireEmpty=*/false);
+	UE_LOG(LogShipCharacter, Log, TEXT("TryRemoveMountItem: %s"), Mount ? *GetNameSafe(Mount) : TEXT("no occupied Mount in range/facing"));
+
+	if (!Mount)
+	{
+		return;
+	}
+
+	AMountableItem* Item = Mount->DetachItem();
+	if (!Item)
+	{
+		return;
+	}
+
+	CarriedMountItem = Item;
+	Item->AttachToComponent(GetMesh(), FAttachmentTransformRules::SnapToTargetIncludingScale, MountItemAttachSocketName);
+}
+
+void AShipCharacter::TryPlaceCarriedMountItem()
+{
+	if (!CarriedMountItem)
+	{
+		return;
+	}
+
+	AMount* Mount = FindNearestMount(/*bRequireEmpty=*/true);
+	UE_LOG(LogShipCharacter, Log, TEXT("TryPlaceCarriedMountItem: %s"), Mount ? *GetNameSafe(Mount) : TEXT("no empty Mount in range/facing"));
+
+	if (!Mount)
+	{
+		return;
+	}
+
+	if (Mount->AttachItem(CarriedMountItem))
+	{
+		CarriedMountItem = nullptr;
+	}
+}
+
 void AShipCharacter::ServerToolUseAction_Implementation()
 {
+	if (CarriedMountItem)
+	{
+		TryPlaceCarriedMountItem();
+		return;
+	}
+
 	if (bIsSwinging || bIsPerformingToolUseAction || bIsSlipping)
 	{
 		UE_LOG(LogShipCharacter, Warning, TEXT("ServerToolUseAction: rejected - bIsSwinging=%d bIsPerformingToolUseAction=%d bIsSlipping=%d"), bIsSwinging, bIsPerformingToolUseAction, bIsSlipping);

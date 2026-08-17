@@ -11,10 +11,12 @@ class AShipActor;
  * Stationary interactable placed on the ship - not a Pawn like ASteeringWheel
  * (nothing to possess here, and no occupancy to enforce - any number of
  * characters can interact with the same closet). AShipCharacter finds the
- * nearest one in range and toggles its own mop-carrying state on interact
- * (see AShipCharacter::ToggleMop); the door itself holds no state and never
- * opens/animates - "opening" the closet is represented purely by the mop
- * appearing/disappearing in the interacting character's hand.
+ * nearest one in range and, on interact, opens a tool menu letting the player
+ * pick which tool (if any) to equip (see AShipCharacter::ClientOpenToolMenu/
+ * RequestEquipTool); the door itself holds no state and never opens/animates
+ * - "opening" the closet is represented purely by the menu appearing on the
+ * interacting player's screen, and the chosen tool appearing/disappearing in
+ * their hand.
  *
  * Attaches itself to the ship's hull in BeginPlay (same as ASteeringWheel) so
  * it rides the deck instead of being left behind as the ship sails on.

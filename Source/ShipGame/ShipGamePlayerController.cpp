@@ -11,6 +11,8 @@
 #include "HelmHUDWidget.h"
 #include "SteeringWheel.h"
 #include "ShipActor.h"
+#include "CannonWidget.h"
+#include "Cannon.h"
 
 void AShipGamePlayerController::BeginPlay()
 {
@@ -46,28 +48,41 @@ void AShipGamePlayerController::BeginPlay()
 
 void AShipGamePlayerController::HandlePossessedPawnChanged(APawn* PreviouslyPossessedPawn, APawn* NewPawn)
 {
-	ASteeringWheel* Wheel = Cast<ASteeringWheel>(NewPawn);
-	if (!Wheel)
+	if (ASteeringWheel* Wheel = Cast<ASteeringWheel>(NewPawn))
 	{
-		if (HelmHUDWidget)
+		AShipActor* Ship = Wheel->GetOrFindControlledShip();
+		if (HelmHUDWidgetClass && Ship)
 		{
-			HelmHUDWidget->RemoveFromParent();
-			HelmHUDWidget = nullptr;
+			HelmHUDWidget = CreateWidget<UHelmHUDWidget>(this, HelmHUDWidgetClass);
+			if (HelmHUDWidget)
+			{
+				HelmHUDWidget->Ship = Ship;
+				HelmHUDWidget->AddToPlayerScreen(0);
+			}
 		}
-		return;
+	}
+	else if (HelmHUDWidget)
+	{
+		HelmHUDWidget->RemoveFromParent();
+		HelmHUDWidget = nullptr;
 	}
 
-	AShipActor* Ship = Wheel->GetOrFindControlledShip();
-	if (!HelmHUDWidgetClass || !Ship)
+	if (ACannon* OperatedCannon = Cast<ACannon>(NewPawn))
 	{
-		return;
+		if (CannonWidgetClass)
+		{
+			CannonWidget = CreateWidget<UCannonWidget>(this, CannonWidgetClass);
+			if (CannonWidget)
+			{
+				CannonWidget->Cannon = OperatedCannon;
+				CannonWidget->AddToPlayerScreen(0);
+			}
+		}
 	}
-
-	HelmHUDWidget = CreateWidget<UHelmHUDWidget>(this, HelmHUDWidgetClass);
-	if (HelmHUDWidget)
+	else if (CannonWidget)
 	{
-		HelmHUDWidget->Ship = Ship;
-		HelmHUDWidget->AddToPlayerScreen(0);
+		CannonWidget->RemoveFromParent();
+		CannonWidget = nullptr;
 	}
 }
 

@@ -12,6 +12,9 @@ class UAnimMontage;
 class AClosetDoor;
 class APuddle;
 class UShipBreakComponent;
+class AMount;
+class AMountableItem;
+class ACannon;
 class UShipToolMenuWidget;
 struct FInputActionValue;
 
@@ -147,6 +150,22 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Wrench")
 	float WrenchRange = 150.f;
 
+	// Max distance (cm) in front of the character to look for an AMount, both
+	// when removing its attached item with the wrench (TryRemoveMountItem)
+	// and when placing a carried item onto an empty one
+	// (TryPlaceCarriedMountItem). Kept separate from WrenchRange/
+	// CleaningRange/InteractionRange for the same reason those are kept
+	// separate from each other.
+	UPROPERTY(EditDefaultsOnly, Category = "Mount")
+	float MountInteractionRange = 150.f;
+
+	// Max distance (cm) to a mounted, unoccupied ACannon for Interact to
+	// begin operating it. Kept separate from MountInteractionRange/
+	// WrenchRange/CleaningRange/InteractionRange for the same reason those
+	// are kept separate from each other.
+	UPROPERTY(EditDefaultsOnly, Category = "Cannon")
+	float CannonInteractionRange = 150.f;
+
 	// How directly the character must be facing a wheel/door to interact with
 	// it, as the min dot product between the character's forward vector and
 	// the direction to the target. 1 = dead-on only, 0 = full 180-degree arc
@@ -182,6 +201,30 @@ protected:
 	// than the mop.
 	UPROPERTY(EditDefaultsOnly, Category = "Wrench")
 	FName WrenchAttachSocketName = TEXT("hand_rSocket");
+
+	// Socket on GetMesh() a carried AMountableItem (see CarriedMountItem)
+	// attaches to. Deliberately a different socket than MopAttachSocketName/
+	// WrenchAttachSocketName so a carried mount item doesn't visually overlap
+	// whichever tool is also equipped - a player can carry a Cannon/Shield
+	// while still holding the wrench, e.g. having just removed it from
+	// another mount.
+	UPROPERTY(EditDefaultsOnly, Category = "Mount")
+	FName MountItemAttachSocketName = TEXT("carry");
+
+	// The AMountableItem (ACannon/AShield) currently carried, if any - set by
+	// TryRemoveMountItem (the wrench's tool-use action, when it finds an
+	// occupied AMount instead of an active UShipBreakComponent) and cleared
+	// by TryPlaceCarriedMountItem once it's handed off to an empty AMount.
+	// Unlike EquippedTool, there's no separate mesh to toggle: the item IS a
+	// AMountableItem actor, so simply attaching/detaching it (see both
+	// functions) is enough for every machine to see it move via that actor's
+	// own built-in attachment replication. Replicated anyway (plain
+	// Replicated, no OnRep needed) purely so SwingAction/ToolUseAction can
+	// check locally on the owning client whether to route left/right-click
+	// into placing this instead of the equipped tool's normal action - see
+	// both functions.
+	UPROPERTY(Replicated)
+	TObjectPtr<AMountableItem> CarriedMountItem;
 
 	// Montage played on every machine while a slip (see TrySlip) is locking
 	// movement. Optional, same as SwingMontage/ToolUseActionMontage.
@@ -297,12 +340,17 @@ protected:
 	 *  ClientOpenToolMenu) at the nearest AClosetDoor in range. */
 	void Interact();
 
-	/** Called for swing-action input - swings the equipped tool if it supports
-	 *  swinging (see FToolDefinition::bCanSwing). */
+	/** Called for swing-action input - while carrying a mount item
+	 *  (CarriedMountItem), tries to place it on the nearest empty AMount
+	 *  instead (see TryPlaceCarriedMountItem); otherwise swings the equipped
+	 *  tool if it supports swinging (see FToolDefinition::bCanSwing). */
 	void SwingAction();
 
-	/** Called for tool-use-action input - activates the equipped tool's
-	 *  secondary effect if it has one (see FToolDefinition::bCanUseToolUseAction). */
+	/** Called for tool-use-action input - while carrying a mount item
+	 *  (CarriedMountItem), tries to place it on the nearest empty AMount
+	 *  instead (see TryPlaceCarriedMountItem); otherwise activates the
+	 *  equipped tool's secondary effect if it has one (see
+	 *  FToolDefinition::bCanUseToolUseAction). */
 	void ToolUseAction();
 
 	// Looks up the currently equipped tool's FToolDefinition, if any.
@@ -337,6 +385,15 @@ protected:
 	// range/facing check is authoritative.
 	UShipBreakComponent* FindNearestActiveShipBreak() const;
 
+	// Finds the nearest AMount within MountInteractionRange, roughly in front
+	// of the character (same facing check as the other FindNearest*
+	// helpers), whose IsEmpty() matches bRequireEmpty - i.e. pass false to
+	// find one to remove an item from (TryRemoveMountItem) or true to find
+	// one to place a carried item onto (TryPlaceCarriedMountItem).
+	// Server-only: called from both, so the range/facing check is
+	// authoritative.
+	AMount* FindNearestMount(bool bRequireEmpty) const;
+
 	// Resolves the equipped tool's tool-use-action gameplay effect - server-
 	// only, called once FToolDefinition::ToolUseActionDuration has elapsed
 	// since ServerToolUseAction (and skipped entirely if ServerCancelToolUseAction
@@ -359,8 +416,29 @@ protected:
 	// character. Server-only, called from ResolveToolUseActionEffect - never
 	// reached if the fixing action was canceled first (see
 	// ServerCancelToolUseAction), so an interrupted wrench never repairs the
-	// hull.
+	// hull. If there's no active UShipBreakComponent in range, falls back to
+	// TryRemoveMountItem - both are "what the wrench does" on a tool-use
+	// action, just against different nearby targets.
 	void PerformWrenchFix();
+
+	// Removes whatever's attached to the nearest occupied AMount within
+	// MountInteractionRange (see FindNearestMount) and gives it to the
+	// player to carry (CarriedMountItem), attaching it to
+	// MountItemAttachSocketName. Server-only, called from PerformWrenchFix -
+	// so, per that function's comment, only ever runs while the wrench is
+	// equipped. No-ops if already carrying something or no occupied mount is
+	// in range/facing.
+	void TryRemoveMountItem();
+
+	// Attaches CarriedMountItem to the nearest empty AMount within
+	// MountInteractionRange (see FindNearestMount) and clears
+	// CarriedMountItem. Server-only, called from ServerSwingAction_
+	// Implementation/ServerToolUseAction_Implementation in place of their
+	// usual tool behavior whenever CarriedMountItem is set - unlike
+	// TryRemoveMountItem, placing doesn't require any particular tool to be
+	// equipped. No-ops if not carrying anything or no empty mount is in
+	// range/facing (CarriedMountItem is left untouched either way).
+	void TryPlaceCarriedMountItem();
 
 	// Clears bIsSlipping - bound as a one-shot timer by MulticastPlaySlip,
 	// mirroring FinishSwing/FinishToolUseAction.
@@ -384,6 +462,13 @@ protected:
 	// Finds the nearest unoccupied ASteeringWheel within InteractionRange, if any.
 	// Server-only: called from ServerInteract so the range check is authoritative.
 	class ASteeringWheel* FindNearestSteeringWheel() const;
+
+	// Finds the nearest unoccupied, currently-mounted ACannon within
+	// CannonInteractionRange, roughly in front of the character (same
+	// facing check as the other FindNearest* helpers), if any. A carried
+	// (unmounted) cannon never matches - see ACannon::TryEngage. Server-only:
+	// called from ServerInteract so the range/facing check is authoritative.
+	ACannon* FindNearestOperableCannon() const;
 
 	// Finds the nearest AClosetDoor within InteractionRange, if any. Server-only:
 	// called from ServerInteract so the range check is authoritative.
