@@ -59,6 +59,16 @@ struct FCannonAmmoType
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Ammo")
 	int32 MaxAmmoCount = 10;
 
+	// If true, UEnemyGunComponent seeks visible player characters (see
+	// UEnemyGunComponent::FindVisiblePlayerTarget) within its cone instead
+	// of the player ship's hull, and the resulting shots damage that
+	// player's Health (see ACannonProjectile::bDamagesPlayerCharacter)
+	// instead of the ship's HullIntegrity. Only meaningful for
+	// UEnemyGunComponent's AmmoType - ACannon ignores this entirely (the
+	// player cannon only ever targets AEnemyShip).
+	UPROPERTY(EditDefaultsOnly, Category = "Ammo")
+	bool bTargetPlayer = false;
+
 	// Minimum seconds between shots while this ammo type is equipped.
 	UPROPERTY(EditDefaultsOnly, Category = "Ammo")
 	float FireCooldown = 1.f;

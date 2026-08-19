@@ -29,11 +29,13 @@ class UNiagaraSystem;
  * generate a hit event, same reasoning as AShipActor's HazardBox - the mesh
  * itself carries no collision (purely visual, same as ItemMesh/BarrelMesh/
  * MopMesh elsewhere in this codebase). OnHit always applies Damage to an
- * AEnemyShip it hits (see EnemyShip.h), and additionally applies Damage to
- * an AShipActor it hits, but only if bDamagesPlayerShip is true - see that
- * flag's comment for why this is conditional (ACannon's own projectiles
- * never set it, so a player can never damage their own ship; UEnemyGunComponent's
- * always do).
+ * AEnemyShip it hits (see EnemyShip.h); additionally applies Damage to an
+ * AShipActor it hits if bDamagesPlayerShip is true, or to an AShipCharacter
+ * it hits if bDamagesPlayerCharacter is true - see those flags' comments for
+ * why this is conditional (ACannon's own projectiles never set either, so a
+ * player can never damage their own ship or another player; UEnemyGunComponent
+ * sets exactly one of the two per shot, depending on the fired ammo type's
+ * FCannonAmmoType::bTargetPlayer).
  *
  * Damage/ProjectileMesh's static mesh/FireSound/ImpactEffect/ImpactSound are
  * all set by ACannon::ServerFire_Implementation right after spawning (see
@@ -90,25 +92,37 @@ public:
 
 	// Whether this projectile can damage the player's AShipActor on hit -
 	// see OnHit. Defaults false (ACannon's own projectiles never set this,
-	// preserving the existing "no self-damage against your own ship" rule),
-	// but UEnemyGunComponent::FireAtTarget sets it true right after spawning
-	// its own projectiles, since those are hostile shots. Set directly by
-	// the firer (not part of ConfigureAmmo - this is about who fired the
-	// shot, not what ammo type it is), and never needs to be replicated:
+	// preserving the existing "no self-damage against your own ship" rule).
+	// UEnemyGunComponent::FireAtTarget sets exactly one of this or
+	// bDamagesPlayerCharacter true right after spawning its own projectiles
+	// (depending on the fired ammo's FCannonAmmoType::bTargetPlayer), since
+	// those are hostile shots. Set directly by the firer (not part of
+	// ConfigureAmmo - this is about who fired the shot and at what kind of
+	// target, not what ammo type it is), and never needs to be replicated:
 	// only the server's own OnHit branch (guarded by HasAuthority()) ever
 	// reads it.
 	bool bDamagesPlayerShip = false;
+
+	// Whether this projectile can damage a player's AShipCharacter (their
+	// Health) on hit - see OnHit. Same defaults-false/set-by-the-firer/
+	// never-replicated reasoning as bDamagesPlayerShip - see its comment.
+	// Set true instead of bDamagesPlayerShip specifically for
+	// UEnemyGunComponent shots fired at a bTargetPlayer ammo type's visible
+	// player target, so those shots damage the targeted player instead of
+	// the ship even if they happen to hit the hull.
+	bool bDamagesPlayerCharacter = false;
 
 protected:
 	virtual void BeginPlay() override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-	// Damages an AEnemyShip hit (see AEnemyShip::ApplyDamage), or an
-	// AShipActor hit if bDamagesPlayerShip is true (see AShipActor::
-	// ApplyDamage), and spawns/plays ImpactEffect/ImpactSound at the impact
-	// point/normal, then destroys the projectile on impact regardless of
-	// what it hit. The ImpactEffect/ImpactSound and collision-disable happen
-	// unconditionally
+	// Damages an AEnemyShip hit (see AEnemyShip::ApplyDamage), an AShipActor
+	// hit if bDamagesPlayerShip is true (see AShipActor::ApplyDamage), or an
+	// AShipCharacter hit if bDamagesPlayerCharacter is true (see
+	// AShipCharacter::ApplyDamage) - and spawns/plays ImpactEffect/
+	// ImpactSound at the impact point/normal, then destroys the projectile
+	// on impact regardless of what it hit. The ImpactEffect/ImpactSound and
+	// collision-disable happen unconditionally
 	// (every machine plays its own local cosmetic effect/sound and stops
 	// this instance generating further hits as soon as it locally detects
 	// one), but Destroy()/ApplyDamage stay Server-only (guarded with

@@ -1,6 +1,7 @@
 #include "Cannon.h"
 #include "Mount.h"
 #include "CannonProjectile.h"
+#include "ShipCharacter.h"
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
@@ -148,6 +149,14 @@ void ACannon::ServerReleaseCannon_Implementation()
 
 		if (PawnToRestore)
 		{
+			// Keeps AShipCharacter's own record of "what am I currently
+			// piloting" in sync - see its CurrentlyPilotedPawn/
+			// ClearCurrentlyPilotedPawn comments.
+			if (AShipCharacter* Character = Cast<AShipCharacter>(PawnToRestore))
+			{
+				Character->ClearCurrentlyPilotedPawn();
+			}
+
 			CurrentController->Possess(PawnToRestore);
 		}
 	}

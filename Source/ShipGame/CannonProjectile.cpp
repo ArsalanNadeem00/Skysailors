@@ -1,6 +1,7 @@
 #include "CannonProjectile.h"
 #include "EnemyShip.h"
 #include "ShipActor.h"
+#include "ShipCharacter.h"
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "GameFramework/ProjectileMovementComponent.h"
@@ -37,6 +38,22 @@ void ACannonProjectile::BeginPlay()
 	Super::BeginPlay();
 
 	SetLifeSpan(LifeSpanSeconds);
+
+	// Keeps this projectile's own movement sweeps from generating a hit
+	// against whatever fired it. Matters most for UEnemyGunComponent::
+	// FireAtTarget, whose SpawnActorDeferred call sets Owner to the firing
+	// AEnemyShip itself (see its comment) - without this, a shot that spawns
+	// clipping its own ship's HazardBox (the muzzle sits on that same ship)
+	// would immediately self-destruct against it, and since OnHit's
+	// AEnemyShip branch applies damage unconditionally (not gated by
+	// bDamagesPlayerShip/bDamagesPlayerCharacter the way the player-ship/
+	// character branches are), it'd even damage its own ship. Harmless for
+	// ACannon's shots too (Owner there is the ACannon itself, which has no
+	// collision to ignore in the first place - see AMountableItem).
+	if (AActor* OwningActor = GetOwner())
+	{
+		CollisionComponent->IgnoreActorWhenMoving(OwningActor, true);
+	}
 
 	if (FireSound)
 	{
@@ -94,6 +111,13 @@ void ACannonProjectile::OnHit(UPrimitiveComponent* HitComponent, AActor* OtherAc
 		if (AEnemyShip* Enemy = Cast<AEnemyShip>(OtherActor))
 		{
 			Enemy->ApplyDamage(Damage);
+		}
+		else if (bDamagesPlayerCharacter)
+		{
+			if (AShipCharacter* Character = Cast<AShipCharacter>(OtherActor))
+			{
+				Character->ApplyDamage(Damage);
+			}
 		}
 		else if (bDamagesPlayerShip)
 		{

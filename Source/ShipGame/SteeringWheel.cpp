@@ -1,5 +1,6 @@
 #include "SteeringWheel.h"
 #include "ShipActor.h"
+#include "ShipCharacter.h"
 #include "Components/StaticMeshComponent.h"
 #include "Camera/CameraComponent.h"
 #include "EnhancedInputComponent.h"
@@ -117,6 +118,14 @@ void ASteeringWheel::ServerReleaseHelm_Implementation()
 
 		if (PawnToRestore)
 		{
+			// Keeps AShipCharacter's own record of "what am I currently
+			// piloting" in sync - see its CurrentlyPilotedPawn/
+			// ClearCurrentlyPilotedPawn comments.
+			if (AShipCharacter* Character = Cast<AShipCharacter>(PawnToRestore))
+			{
+				Character->ClearCurrentlyPilotedPawn();
+			}
+
 			CurrentController->Possess(PawnToRestore);
 		}
 	}

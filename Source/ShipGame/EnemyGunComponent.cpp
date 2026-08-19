@@ -1,7 +1,9 @@
 #include "EnemyGunComponent.h"
 #include "EnemyShip.h"
 #include "ShipActor.h"
+#include "ShipCharacter.h"
 #include "CannonProjectile.h"
+#include "GameFramework/ProjectileMovementComponent.h"
 #include "Engine/World.h"
 
 UEnemyGunComponent::UEnemyGunComponent()
@@ -27,15 +29,19 @@ void UEnemyGunComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		return;
 	}
 
-	AShipActor* TargetShip = GetTargetShip();
-	if (!TargetShip)
+	if (AmmoType.bTargetPlayer)
 	{
-		return;
+		if (AShipCharacter* PlayerTarget = FindVisiblePlayerTarget())
+		{
+			FireAtTarget(PlayerTarget);
+		}
 	}
-
-	if (IsTargetInFiringArc(TargetShip))
+	else if (AShipActor* TargetShip = GetTargetShip())
 	{
-		FireAtTarget(TargetShip);
+		if (IsLocationInFiringArc(TargetShip->GetActorLocation()))
+		{
+			FireAtTarget(TargetShip);
+		}
 	}
 }
 
@@ -45,9 +51,32 @@ AShipActor* UEnemyGunComponent::GetTargetShip() const
 	return OwningShip ? OwningShip->ControlledShip : nullptr;
 }
 
-bool UEnemyGunComponent::IsTargetInFiringArc(const AShipActor* TargetShip) const
+AShipCharacter* UEnemyGunComponent::FindVisiblePlayerTarget() const
 {
-	const FVector ToTarget = TargetShip->GetActorLocation() - GetComponentLocation();
+	for (const TWeakObjectPtr<AShipCharacter>& CandidatePtr : AShipCharacter::GetActiveShipCharacters())
+	{
+		AShipCharacter* Candidate = CandidatePtr.Get();
+
+		// Covers both directly-controlled characters and ones currently
+		// piloting a wheel/cannon (their body just stands wherever they got
+		// in) - see IsEffectivelyPlayerControlled's comment.
+		if (!Candidate || !Candidate->IsEffectivelyPlayerControlled())
+		{
+			continue;
+		}
+
+		if (IsLocationInFiringArc(Candidate->GetActorLocation()) && HasLineOfSightTo(Candidate))
+		{
+			return Candidate;
+		}
+	}
+
+	return nullptr;
+}
+
+bool UEnemyGunComponent::IsLocationInFiringArc(const FVector& TargetLocation) const
+{
+	const FVector ToTarget = TargetLocation - GetComponentLocation();
 	const float Distance = ToTarget.Size();
 	if (Distance <= 0.f || Distance > FiringRange)
 	{
@@ -59,7 +88,63 @@ bool UEnemyGunComponent::IsTargetInFiringArc(const AShipActor* TargetShip) const
 	return DotToTarget >= CosHalfAngle;
 }
 
-void UEnemyGunComponent::FireAtTarget(const AShipActor* TargetShip)
+bool UEnemyGunComponent::HasLineOfSightTo(const AActor* Target) const
+{
+	FCollisionQueryParams QueryParams;
+	QueryParams.AddIgnoredActor(GetOwner());
+	QueryParams.AddIgnoredActor(Target);
+
+	FHitResult Hit;
+	const bool bBlocked = GetWorld()->LineTraceSingleByChannel(Hit, GetComponentLocation(), Target->GetActorLocation(), ECC_Visibility, QueryParams);
+	return !bBlocked;
+}
+
+FVector UEnemyGunComponent::PredictTargetLocation(const AActor* Target) const
+{
+	const FVector TargetLocation = Target->GetActorLocation();
+
+	// Ship-targeting shots have nothing to lead relative to - GetTargetShip()
+	// IS Target here, so its own velocity would just be lagging behind
+	// itself.
+	if (!AmmoType.bTargetPlayer)
+	{
+		return TargetLocation;
+	}
+
+	AShipActor* PlayerShip = GetTargetShip();
+	if (!PlayerShip)
+	{
+		return TargetLocation;
+	}
+
+	const FVector ShipVelocity = PlayerShip->GetVelocity();
+	if (ShipVelocity.IsNearlyZero())
+	{
+		return TargetLocation;
+	}
+
+	// Reads InitialSpeed off ProjectileClass's own CDO rather than an
+	// already-spawned instance - this runs before FireAtTarget spawns
+	// anything, so the aim direction/velocity assignment there both end up
+	// based on the same predicted point. ProjectileClass is guaranteed valid
+	// here - FireAtTarget already returned early otherwise, before ever
+	// calling this.
+	const ACannonProjectile* ProjectileDefaults = ProjectileClass->GetDefaultObject<ACannonProjectile>();
+	const float ProjectileSpeed = ProjectileDefaults && ProjectileDefaults->ProjectileMovement
+		? ProjectileDefaults->ProjectileMovement->InitialSpeed
+		: 0.f;
+	if (ProjectileSpeed <= 0.f)
+	{
+		return TargetLocation;
+	}
+
+	const float Distance = FVector::Dist(GetComponentLocation(), TargetLocation);
+	const float FlightTime = Distance / ProjectileSpeed;
+
+	return TargetLocation + ShipVelocity * FlightTime;
+}
+
+void UEnemyGunComponent::FireAtTarget(const AActor* Target)
 {
 	if (!ProjectileClass)
 	{
@@ -83,9 +168,11 @@ void UEnemyGunComponent::FireAtTarget(const AShipActor* TargetShip)
 		AmmoType.AmmoCount = FMath::Max(AmmoType.AmmoCount - 1, 0);
 	}
 
-	// Aimed directly at the target's current position, not fired along this
-	// component's fixed facing - see the class comment for why.
-	const FRotator AimRotation = (TargetShip->GetActorLocation() - GetComponentLocation()).Rotation();
+	// Aimed at PredictTargetLocation(Target), not fired along this
+	// component's fixed facing, and not just at Target's current position
+	// either - see the class comment/PredictTargetLocation's comment.
+	const FVector AimPoint = PredictTargetLocation(Target);
+	const FRotator AimRotation = (AimPoint - GetComponentLocation()).Rotation();
 	const FTransform SpawnTransform(AimRotation, GetComponentLocation());
 
 	// Deferred, not a plain SpawnActor - ConfigureAmmo needs to set this
@@ -97,10 +184,36 @@ void UEnemyGunComponent::FireAtTarget(const AShipActor* TargetShip)
 		Projectile->ConfigureAmmo(AmmoType.Damage, AmmoType.ProjectileMesh, AmmoType.FireSound, AmmoType.ImpactEffect, AmmoType.ImpactSound);
 
 		// Unlike ACannon's projectiles (which never damage the player's own
-		// AShipActor - see this flag's comment on ACannonProjectile), this
-		// is a hostile shot and should be able to hurt the player ship.
-		Projectile->bDamagesPlayerShip = true;
+		// AShipActor/AShipCharacter - see those flags' comments), this is a
+		// hostile shot and should be able to hurt whichever kind of target
+		// AmmoType.bTargetPlayer says it was aimed at.
+		if (AmmoType.bTargetPlayer)
+		{
+			Projectile->bDamagesPlayerCharacter = true;
+		}
+		else
+		{
+			Projectile->bDamagesPlayerShip = true;
+		}
 
 		Projectile->FinishSpawning(SpawnTransform);
+
+		// Explicitly (re)set the projectile's velocity to fly exactly along
+		// AimRotation, rather than relying solely on
+		// UProjectileMovementComponent's own implicit "derive Velocity from
+		// InitialSpeed + spawn rotation" behavior (which runs automatically
+		// during component registration, as part of FinishSpawning above).
+		// That implicit derivation is what ACannon's own shots also rely on,
+		// but a human aiming ACannon self-corrects by eye, so any small
+		// imprecision there is invisible - this gun's aim has no such
+		// feedback loop, so the same imprecision would show up directly as
+		// shots consistently landing near, but not exactly on, a target.
+		// Setting Velocity here, after the projectile is fully spawned,
+		// guarantees this shot flies precisely at the target's location
+		// this tick sampled, with nothing left to implicit timing.
+		if (Projectile->ProjectileMovement)
+		{
+			Projectile->ProjectileMovement->Velocity = AimRotation.Vector() * Projectile->ProjectileMovement->InitialSpeed;
+		}
 	}
 }

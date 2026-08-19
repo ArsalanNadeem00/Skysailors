@@ -13,14 +13,18 @@
 #include "MountableItem.h"
 #include "Cannon.h"
 #include "ShipToolMenuWidget.h"
+#include "ShipGamePlayerController.h"
 #include "Blueprint/UserWidget.h"
 #include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "Net/UnrealNetwork.h"
 #include "TimerManager.h"
 #include "Animation/AnimInstance.h"
 
 DEFINE_LOG_CATEGORY(LogShipCharacter);
+
+TArray<TWeakObjectPtr<AShipCharacter>> AShipCharacter::ActiveShipCharacters;
 
 AShipCharacter::AShipCharacter()
 {
@@ -66,6 +70,50 @@ AShipCharacter::AShipCharacter()
 void AShipCharacter::BeginPlay()
 {
 	Super::BeginPlay();
+
+	ActiveShipCharacters.Add(this);
+
+	// Captured once, right at spawn (AShipGameMode::SpawnPlayerOnShip has
+	// already placed this character at its assigned deck spawn point by the
+	// time BeginPlay runs) - see RespawnCharacter for why this is stored
+	// relative to the ship rather than as a raw world transform. Assumes
+	// exactly one ship is placed in the level, same lazy-find pattern as
+	// AMount/APuddle/AEnemyShip/etc.
+	TArray<AActor*> FoundShips;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), AShipActor::StaticClass(), FoundShips);
+	if (FoundShips.Num() > 0)
+	{
+		SpawnShip = Cast<AShipActor>(FoundShips[0]);
+		if (SpawnShip)
+		{
+			RespawnRelativeTransform = GetActorTransform().GetRelativeTransform(SpawnShip->GetActorTransform());
+		}
+	}
+}
+
+void AShipCharacter::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	// Server-only, same authority convention as ApplyDamage/StartDefeatSequence
+	// (CheckFallDeath ultimately calls ApplyDamage, which assumes its caller
+	// is already authoritative rather than checking HasAuthority() itself) -
+	// a client running this would just be predicting a defeat sequence the
+	// server never actually started.
+	if (HasAuthority())
+	{
+		CheckFallDeath();
+	}
+}
+
+void AShipCharacter::EndPlay(EEndPlayReason::Type EndPlayReason)
+{
+	ActiveShipCharacters.RemoveAll([this](const TWeakObjectPtr<AShipCharacter>& Ptr)
+	{
+		return !Ptr.IsValid() || Ptr.Get() == this;
+	});
+
+	Super::EndPlay(EndPlayReason);
 }
 
 void AShipCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -73,6 +121,161 @@ void AShipCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLi
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	DOREPLIFETIME(AShipCharacter, EquippedTool);
 	DOREPLIFETIME(AShipCharacter, CarriedMountItem);
+	DOREPLIFETIME(AShipCharacter, Health);
+	DOREPLIFETIME(AShipCharacter, Hunger);
+	DOREPLIFETIME(AShipCharacter, MaxHealth);
+	DOREPLIFETIME(AShipCharacter, MaxHunger);
+}
+
+void AShipCharacter::SetHealth(float NewHealth)
+{
+	Health = FMath::Clamp(NewHealth, 0.f, MaxHealth);
+}
+
+void AShipCharacter::SetHunger(float NewHunger)
+{
+	Hunger = FMath::Clamp(NewHunger, 0.f, MaxHunger);
+}
+
+void AShipCharacter::ApplyDamage(float Amount)
+{
+	if (bIsDefeated)
+	{
+		return;
+	}
+
+	const float PreviousHealth = GetHealth();
+	SetHealth(PreviousHealth - Amount);
+
+	if (GetHealth() < PreviousHealth)
+	{
+		ClientPlayHitFlash();
+	}
+
+	if (GetHealth() <= 0.f)
+	{
+		StartDefeatSequence();
+	}
+}
+
+void AShipCharacter::StartDefeatSequence()
+{
+	ForceUnpilot();
+
+	MulticastPlayDefeat(DefeatMontage, DefeatFadeOutDuration);
+	GetWorldTimerManager().SetTimer(RespawnTimerHandle, this, &AShipCharacter::RespawnCharacter, RespawnDelaySeconds, false);
+}
+
+void AShipCharacter::CheckFallDeath()
+{
+	if (bIsDefeated)
+	{
+		return;
+	}
+
+	if (GetActorLocation().Z <= FallDeathZThreshold)
+	{
+		ApplyDamage(GetHealth());
+	}
+}
+
+bool AShipCharacter::IsEffectivelyPlayerControlled() const
+{
+	if (IsPlayerControlled())
+	{
+		return true;
+	}
+
+	return CurrentlyPilotedPawn && CurrentlyPilotedPawn->IsPlayerControlled();
+}
+
+APlayerController* AShipCharacter::GetEffectiveController() const
+{
+	if (AController* DirectController = GetController())
+	{
+		return Cast<APlayerController>(DirectController);
+	}
+
+	return CurrentlyPilotedPawn ? Cast<APlayerController>(CurrentlyPilotedPawn->GetController()) : nullptr;
+}
+
+void AShipCharacter::ForceUnpilot()
+{
+	if (!CurrentlyPilotedPawn)
+	{
+		return;
+	}
+
+	// Possess(this) triggers CurrentlyPilotedPawn's own UnPossessed()
+	// override (ASteeringWheel::UnPossessed/ACannon::UnPossessed) exactly as
+	// it would on a normal release, since that's an engine callback fired
+	// by the possession change itself, not something either release path
+	// invokes directly.
+	if (AController* PilotController = CurrentlyPilotedPawn->GetController())
+	{
+		PilotController->Possess(this);
+	}
+
+	CurrentlyPilotedPawn = nullptr;
+}
+
+void AShipCharacter::MulticastPlayDefeat_Implementation(UAnimMontage* MontageToPlay, float FadeOutDuration)
+{
+	bIsDefeated = true;
+	GetCharacterMovement()->StopMovementImmediately();
+
+	if (UAnimInstance* AnimInstance = MontageToPlay && GetMesh() ? GetMesh()->GetAnimInstance() : nullptr)
+	{
+		AnimInstance->Montage_Play(MontageToPlay);
+	}
+
+	if (IsLocallyControlled())
+	{
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		{
+			if (PC->PlayerCameraManager)
+			{
+				PC->PlayerCameraManager->StartCameraFade(0.f, 1.f, FadeOutDuration, FLinearColor::Black, /*bFadeAudio=*/false, /*bHoldWhenFinished=*/true);
+			}
+		}
+	}
+}
+
+void AShipCharacter::RespawnCharacter()
+{
+	if (SpawnShip)
+	{
+		const FTransform NewTransform = RespawnRelativeTransform * SpawnShip->GetActorTransform();
+		SetActorLocationAndRotation(NewTransform.GetLocation(), NewTransform.GetRotation());
+	}
+
+	SetHealth(MaxHealth);
+
+	MulticastFinishDefeat(DefeatFadeInDuration);
+}
+
+void AShipCharacter::MulticastFinishDefeat_Implementation(float FadeInDuration)
+{
+	bIsDefeated = false;
+
+	if (IsLocallyControlled())
+	{
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		{
+			if (PC->PlayerCameraManager)
+			{
+				PC->PlayerCameraManager->StartCameraFade(1.f, 0.f, FadeInDuration, FLinearColor::Black, /*bFadeAudio=*/false, /*bHoldWhenFinished=*/false);
+			}
+		}
+	}
+}
+
+void AShipCharacter::ClientPlayHitFlash_Implementation()
+{
+	if (AShipGamePlayerController* PC = Cast<AShipGamePlayerController>(GetEffectiveController()))
+	{
+		PC->PlayCharacterHitFlash();
+	}
 }
 
 void AShipCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -131,7 +334,7 @@ void AShipCharacter::Look(const FInputActionValue& Value)
 
 void AShipCharacter::DoMove(float Right, float Forward)
 {
-	if (bIsPerformingToolUseAction || bIsSlipping)
+	if (bIsPerformingToolUseAction || bIsSlipping || bIsDefeated)
 	{
 		return;
 	}
@@ -165,7 +368,7 @@ void AShipCharacter::DoLook(float Yaw, float Pitch)
 
 void AShipCharacter::DoJumpStart()
 {
-	if (bIsPerformingToolUseAction || bIsSlipping)
+	if (bIsPerformingToolUseAction || bIsSlipping || bIsDefeated)
 	{
 		return;
 	}
@@ -458,13 +661,24 @@ void AShipCharacter::ServerInteract_Implementation()
 {
 	if (ASteeringWheel* Wheel = FindNearestSteeringWheel())
 	{
-		Wheel->TryEngage(GetController(), this);
+		// Only actually record this as the pawn we're now piloting if
+		// TryEngage really succeeded - it returns false (and possesses
+		// nothing) if someone else already occupies the wheel, in which
+		// case there's nothing to remember. See CurrentlyPilotedPawn's
+		// comment for why this matters (enemy-gun targeting/ForceUnpilot).
+		if (Wheel->TryEngage(GetController(), this))
+		{
+			CurrentlyPilotedPawn = Wheel;
+		}
 		return;
 	}
 
 	if (ACannon* Cannon = FindNearestOperableCannon())
 	{
-		Cannon->TryEngage(GetController(), this);
+		if (Cannon->TryEngage(GetController(), this))
+		{
+			CurrentlyPilotedPawn = Cannon;
+		}
 		return;
 	}
 

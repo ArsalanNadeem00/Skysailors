@@ -15,7 +15,9 @@ class UShipBreakComponent;
 class AMount;
 class AMountableItem;
 class ACannon;
+class AShipActor;
 class UShipToolMenuWidget;
+class APlayerController;
 struct FInputActionValue;
 
 DECLARE_LOG_CATEGORY_EXTERN(LogShipCharacter, Log, All);
@@ -322,10 +324,283 @@ protected:
 public:
 	AShipCharacter();
 
+	// Upper bound Health can ever reach - see SetHealth, which clamps
+	// against this. Starts equal to Health's own starting value (100), so
+	// Health starts full by default.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "Character|Stats")
+	float MaxHealth = 100.f;
+
+	// Upper bound Hunger can ever reach - see SetHunger. Same reasoning as
+	// MaxHealth.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = "Character|Stats")
+	float MaxHunger = 100.f;
+
+	UFUNCTION(BlueprintPure, Category = "Character|Stats")
+	float GetHealth() const { return Health; }
+
+	UFUNCTION(BlueprintPure, Category = "Character|Stats")
+	float GetHunger() const { return Hunger; }
+
+	// Sets Health, clamped to [0, MaxHealth] - the only way Health is ever
+	// allowed to change, so it can never exceed MaxHealth (or drop below 0)
+	// regardless of what calls this or by how much. Health itself is
+	// protected specifically to force this - no other code, C++ or
+	// Blueprint, can assign to it directly and bypass the clamp. No damage/
+	// regen sources call this yet - still belongs here once designed, same
+	// as Health/Hunger's own original comment. Server-only in practice once
+	// something does call it (same "assumes caller is already
+	// authoritative" convention as AShipActor::RepairHull/ApplyDamage), but
+	// doesn't enforce that itself yet since nothing calls it at all.
+	UFUNCTION(BlueprintCallable, Category = "Character|Stats")
+	void SetHealth(float NewHealth);
+
+	// Sets Hunger, clamped to [0, MaxHunger]. Same reasoning as SetHealth.
+	UFUNCTION(BlueprintCallable, Category = "Character|Stats")
+	void SetHunger(float NewHunger);
+
+	// Drops Health by Amount, via SetHealth (so it stays clamped to
+	// [0, MaxHealth]) - called by ACannonProjectile::OnHit when a hostile,
+	// player-targeting projectile (see ACannonProjectile::
+	// bDamagesPlayerCharacter, set by UEnemyGunComponent for ammo types with
+	// FCannonAmmoType::bTargetPlayer) hits this character. No-ops entirely
+	// while bIsDefeated (already at 0 and mid-respawn-sequence - see
+	// StartDefeatSequence) so a defeated player can't take further damage or
+	// re-trigger the sequence. Otherwise flashes ClientPlayHitFlash (if
+	// Amount actually took effect) and, if Health just reached 0, starts the
+	// defeat sequence. Server-only in practice, same
+	// assumes-caller-is-authoritative convention as AShipActor::ApplyDamage/
+	// AEnemyShip::ApplyDamage.
+	UFUNCTION(BlueprintCallable, Category = "Character|Stats")
+	void ApplyDamage(float Amount);
+
+	// Every AShipCharacter currently in the world, added/removed in
+	// BeginPlay/EndPlay - lets UEnemyGunComponent::FindVisiblePlayerTarget
+	// scan player characters without a per-tick
+	// UGameplayStatics::GetAllActorsOfClass call, same reasoning/pattern as
+	// AEnemyShip::ActiveEnemyShips.
+	static const TArray<TWeakObjectPtr<AShipCharacter>>& GetActiveShipCharacters() { return ActiveShipCharacters; }
+
+	// True if a player is actively controlling this character, either
+	// directly (IsPlayerControlled()) or by proxy while piloting a
+	// ASteeringWheel/ACannon this character engaged (see
+	// CurrentlyPilotedPawn) - this character's own body is simply left
+	// standing wherever it was when they got in, still a real, positioned
+	// actor in the world, so there's nothing else needed to keep it a valid
+	// target/damage-recipient once this returns true for it. Used by
+	// UEnemyGunComponent::FindVisiblePlayerTarget so a piloting player can
+	// still be hit exactly as if they were still walking around.
+	bool IsEffectivelyPlayerControlled() const;
+
+	// Clears CurrentlyPilotedPawn - called by ASteeringWheel::
+	// ServerReleaseHelm_Implementation/ACannon::ServerReleaseCannon_Implementation
+	// right before they hand control back on a normal release (the
+	// piloting player interacting again), so this character's own
+	// bookkeeping of "what am I currently piloting" stays in sync with
+	// reality. Public since CurrentlyPilotedPawn itself is protected and
+	// those are different classes - ForceUnpilot (the other path that ends
+	// piloting, this character reaching 0 Health while piloting) clears it
+	// directly instead, since that has protected access from within this
+	// class.
+	void ClearCurrentlyPilotedPawn() { CurrentlyPilotedPawn = nullptr; }
+
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(EEndPlayReason::Type EndPlayReason) override;
+	virtual void Tick(float DeltaTime) override;
 
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	// Player's health, 0-MaxHealth. Starts at 100 - no regen sources wired up
+	// yet (still belongs here once designed), but damage (ApplyDamage) and
+	// the resulting defeat/respawn sequence are - see StartDefeatSequence.
+	// Replicated so UCharacterHUDWidget's health bar stays in sync, same
+	// VisibleAnywhere/BlueprintReadOnly/Replicated shape as
+	// AShipActor::HullIntegrity/AEnemyShip::HullIntegrity. Protected (not
+	// public) - see SetHealth for why: it's the only permitted way to
+	// change this, and being protected is what actually makes that a
+	// guarantee rather than a convention. Read via GetHealth().
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Character|Stats")
+	float Health = 100.f;
+
+	// Player's hunger, 0-MaxHunger. Starts at 100 - no depletion-over-time
+	// or low-hunger effects wired up yet (still belongs here once
+	// designed). Protected for the same reason as Health - see SetHunger.
+	// Read via GetHunger().
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Replicated, Category = "Character|Stats")
+	float Hunger = 100.f;
+
+	// Backs GetActiveShipCharacters() - see its comment. A static registry
+	// rather than a per-tick UGameplayStatics::GetAllActorsOfClass scan,
+	// same reasoning as AEnemyShip::ActiveEnemyShips.
+	static TArray<TWeakObjectPtr<AShipCharacter>> ActiveShipCharacters;
+
+	// Montage played on every machine while the defeat sequence's movement
+	// lock is in effect - see MulticastPlayDefeat. Optional, same as
+	// SlipMontage/SwingMontage.
+	UPROPERTY(EditDefaultsOnly, Category = "Defeat")
+	UAnimMontage* DefeatMontage = nullptr;
+
+	// How long (seconds) the screen fade to black takes, starting the
+	// moment Health reaches 0 (alongside the movement lock/DefeatMontage,
+	// not after it finishes - see MulticastPlayDefeat's comment for why).
+	// Only the defeated player's own screen fades - see IsLocallyControlled()
+	// in MulticastPlayDefeat_Implementation.
+	UPROPERTY(EditDefaultsOnly, Category = "Defeat")
+	float DefeatFadeOutDuration = 1.f;
+
+	// How long (seconds) after Health reaches 0 the player respawns - see
+	// StartDefeatSequence/RespawnCharacter. Measured from the start of the
+	// defeat sequence, not from when the fade-out finishes.
+	UPROPERTY(EditDefaultsOnly, Category = "Defeat")
+	float RespawnDelaySeconds = 3.f;
+
+	// How long (seconds) the screen takes to fade back in from black once
+	// RespawnCharacter runs - see MulticastFinishDefeat.
+	UPROPERTY(EditDefaultsOnly, Category = "Defeat")
+	float DefeatFadeInDuration = 1.f;
+
+	// World Z (cm) at or below which this character is considered to have
+	// fallen off the ship (e.g. into the sea below deck level) - checked
+	// every tick by CheckFallDeath. EditDefaultsOnly since the right value
+	// depends entirely on where a given level places its ship/sea, unlike
+	// the fixed gameplay durations above.
+	UPROPERTY(EditDefaultsOnly, Category = "Defeat")
+	float FallDeathZThreshold = 25000.f;
+
+	// True on every machine while the defeat sequence (movement lock,
+	// DefeatMontage, screen fade) is in effect - set by MulticastPlayDefeat
+	// and cleared by MulticastFinishDefeat once RespawnCharacter runs, same
+	// per-machine-cosmetic-but-also-movement-relevant pattern as bIsSlipping
+	// (checked alongside it in DoMove/DoJumpStart). Not replicated - every
+	// machine sets/clears it identically via those two NetMulticasts, same
+	// reasoning as bIsSlipping.
+	bool bIsDefeated = false;
+
+	// The ASteeringWheel/ACannon this character is currently piloting, if
+	// any - set in ServerInteract_Implementation right after this character
+	// successfully engages one (TryEngage returning true), and cleared
+	// either by ASteeringWheel::ServerReleaseHelm_Implementation/
+	// ACannon::ServerReleaseCannon_Implementation on a normal release, or by
+	// ForceUnpilot on a forced one. See IsEffectivelyPlayerControlled/
+	// GetEffectiveController for why this exists: while piloting, this
+	// character itself has no Controller (its own controller has possessed
+	// the wheel/cannon instead), so there's nothing else linking this body
+	// back to the player actually still responsible for it. Not replicated -
+	// only ever read server-side (UEnemyGunComponent's targeting is
+	// server-only, and GetEffectiveController/ForceUnpilot are only called
+	// from other server-only paths).
+	UPROPERTY()
+	APawn* CurrentlyPilotedPawn = nullptr;
+
+	// This character's own Controller if directly possessed, or otherwise
+	// CurrentlyPilotedPawn's Controller (the same player, just currently
+	// possessing the wheel/cannon this character engaged instead) - see
+	// CurrentlyPilotedPawn's comment. Used by ClientPlayHitFlash_Implementation,
+	// since GetController() alone would return null while piloting even
+	// though the same player is still very much present and playing.
+	APlayerController* GetEffectiveController() const;
+
+	// Forces this character's player back into direct possession of this
+	// character - the exact same "give control back" transition
+	// ASteeringWheel::ServerReleaseHelm/ACannon::ServerReleaseCannon
+	// normally perform on interact (Controller->Possess(this) triggers the
+	// wheel/cannon's own UnPossessed() override identically either way),
+	// just triggered by this character reaching 0 Health instead of the
+	// player pressing the interact key. No-ops if CurrentlyPilotedPawn is
+	// unset (already directly possessed). Called from StartDefeatSequence
+	// before the rest of the sequence runs, so that sequence's
+	// IsLocallyControlled() checks (see MulticastPlayDefeat/
+	// MulticastFinishDefeat) correctly resolve against this character - they
+	// couldn't while it remained unpossessed.
+	void ForceUnpilot();
+
+	// Server-only timer from StartDefeatSequence to RespawnCharacter, keyed
+	// off RespawnDelaySeconds.
+	FTimerHandle RespawnTimerHandle;
+
+	// The ship this character originally spawned on, and this character's
+	// spawn transform relative to that ship's root (both captured once in
+	// BeginPlay) - see RespawnCharacter. Relative, not a frozen world-space
+	// transform, specifically because the ship never stops moving (see
+	// AShipActor's class comment) - respawning at a stale world coordinate
+	// would drop the player in empty air/ocean far behind wherever the ship
+	// actually is by respawn time. Recomputing RespawnRelativeTransform *
+	// SpawnShip->GetActorTransform() at respawn time instead gives back the
+	// same deck spot ("initial spawn location") regardless of how far the
+	// ship has traveled/turned since. Auto-found the same
+	// lazy-find-the-one-ship pattern as AMount/APuddle/AEnemyShip/etc.
+	// (assumes exactly one ship in the level).
+	UPROPERTY()
+	AShipActor* SpawnShip;
+
+	FTransform RespawnRelativeTransform;
+
+	// Server-only - starts the defeat sequence once Health reaches 0. Calls
+	// ForceUnpilot first (a no-op if this character wasn't piloting a
+	// wheel/cannon), so the rest of the sequence always runs against an
+	// actually-possessed character - see ForceUnpilot's comment for why
+	// that matters. Then calls MulticastPlayDefeat (movement lock + montage
+	// + fade-out all start together - see its comment) and starts
+	// RespawnTimerHandle for RespawnDelaySeconds, after which
+	// RespawnCharacter runs.
+	void StartDefeatSequence();
+
+	// Server-only, called every tick from Tick() - kills this character (see
+	// FallDeathZThreshold) once they've fallen below the level's playable
+	// space, e.g. off the edge of the ship into the sea. Routes through
+	// ApplyDamage(GetHealth()) rather than calling SetHealth(0.f)/
+	// StartDefeatSequence directly, so falling off the ship triggers exactly
+	// the same hit-flash + defeat/respawn sequence any other damage source
+	// does once Health reaches 0 - one single "Health hit zero" path rather
+	// than a second one just for this. No-ops while already bIsDefeated (that
+	// same check also lives inside ApplyDamage, but skipping it here as well
+	// avoids recomputing GetActorLocation() every tick during the respawn
+	// delay for no reason).
+	void CheckFallDeath();
+
+	// Locks movement (bIsDefeated, checked in DoMove/DoJumpStart) and plays
+	// DefeatMontage on every machine, same "server decides, everyone plays
+	// it" cosmetic replication as MulticastPlaySlip/MulticastPlaySwing.
+	// Additionally, only on the defeated player's own local machine (see
+	// IsLocallyControlled()), fades that player's own screen to black over
+	// FadeOutDuration - deliberately not sent as a separate Client RPC the
+	// way ACannon::ClientPlayFireCameraShake is; IsLocallyControlled()
+	// inside this same Multicast is simpler and achieves the identical
+	// "only the relevant player" scoping. Starts immediately alongside the
+	// movement lock/montage (not delayed until the montage finishes) - so
+	// the screen gradually darkens while the defeat animation plays, ending
+	// fully black by the time FadeOutDuration elapses; retime
+	// FadeOutDuration/DefeatMontage's own length against each other once
+	// real montage art exists if a different feel is wanted.
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastPlayDefeat(UAnimMontage* MontageToPlay, float FadeOutDuration);
+
+	// Server-only timer callback (RespawnTimerHandle) - teleports back to
+	// the initial spawn location (see SpawnShip/RespawnRelativeTransform),
+	// restores Health to MaxHealth, and calls MulticastFinishDefeat. The
+	// screen is already fully held at black (see MulticastPlayDefeat) by
+	// the time this runs, which is what keeps the teleport itself from ever
+	// being visible, regardless of the small amount of time normal Character
+	// movement replication takes to catch up on remote clients.
+	void RespawnCharacter();
+
+	// Clears the movement lock (bIsDefeated) on every machine and, only on
+	// the respawned player's own local machine, fades their screen back in
+	// from black over FadeInDuration - same IsLocallyControlled()-gated
+	// scoping and "server decides, everyone plays it" shape as
+	// MulticastPlayDefeat. Called only from RespawnCharacter, once the
+	// teleport/Health reset have already happened.
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastFinishDefeat(float FadeInDuration);
+
+	// Client RPC (routes to this character's own possessing connection
+	// automatically, same as ACannon::ClientPlayFireCameraShake) - called by
+	// ApplyDamage whenever damage actually lands, so just the damaged
+	// player sees a brief red screen-edge flash (see
+	// AShipGamePlayerController::PlayCharacterHitFlash/
+	// UCharacterHUDWidget::PlayHitFlash) alerting them they've been hit.
+	UFUNCTION(Client, Reliable)
+	void ClientPlayHitFlash();
 
 	/** Bind Enhanced Input actions - the mapping context itself is added by
 	 *  the PlayerController (AShipGamePlayerController), not here. */

@@ -135,6 +135,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ship")
 	USceneComponent* GetSpawnPoint(int32 Index) const;
 
+	// Overrides AActor::GetVelocity() (which would otherwise return zero -
+	// this ship moves via direct MoveComponent/AddActorWorldOffset calls
+	// each tick in MoveShip, not through a MovementComponent that keeps the
+	// engine's usual velocity tracking updated) with the same forward-cruise
+	// + ascend/descend math MoveShip itself applies, omitting the transient
+	// crash-knockback slice - good enough for callers that just need an
+	// instantaneous velocity estimate rather than an exact per-tick replay,
+	// e.g. UEnemyGunComponent::PredictTargetLocation leading a shot fired at
+	// a player standing on this ship's deck.
+	virtual FVector GetVelocity() const override;
+
 	// Picks a uniformly random point within DeckArea's horizontal footprint,
 	// at DeckArea's own height - i.e. somewhere on the ship's walkable deck
 	// surface, never below it. Returns false (leaving OutLocation untouched)

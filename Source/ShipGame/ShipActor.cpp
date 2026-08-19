@@ -140,6 +140,18 @@ void AShipActor::CorrectDriftFromServer(float DeltaTime)
 	SetActorRotation(CorrectedRotation);
 }
 
+FVector AShipActor::GetVelocity() const
+{
+	FVector Velocity = GetActorForwardVector() * ForwardSpeed;
+
+	if (!FMath::IsNearlyZero(CurrentVerticalInput))
+	{
+		Velocity += FVector::UpVector * HelmVerticalSpeed * CurrentVerticalInput;
+	}
+
+	return Velocity;
+}
+
 void AShipActor::MoveShip(float DeltaTime)
 {
 	FVector Delta = GetActorForwardVector() * ForwardSpeed * DeltaTime;
